@@ -1,0 +1,24 @@
+name: Firmware-free checks
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev zlib1g-dev libfdt-dev
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+      - name: Source integrity and synthetic tests
+        run: |
+          . .venv/bin/activate
+          python tools/verify_release.py
+          sh tests/run.sh
+          python tools/make_cmos.py
+      - name: QEMU build and QTest
+        run: |
+          . .venv/bin/activate
+          python tools/build.py --jobs 4
+          python tests/test_irq99.py --qemu .build/build/qemu-system-arm

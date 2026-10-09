@@ -1,0 +1,89 @@
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Z6 调试</title>
+<style>
+:root{color-scheme:dark;font-family:Arial,"Microsoft YaHei",sans-serif;background:#111;color:#ddd;font-size:13px}
+*{box-sizing:border-box;border-radius:0}
+[hidden]{display:none!important}
+body{margin:0}
+main{max-width:916px;margin:12px auto;padding:0 12px}
+.layout{display:grid;grid-template-columns:minmax(0,720px) 160px;gap:12px;align-items:start}
+.screen{position:relative;aspect-ratio:3/2;background:#000;overflow:hidden}
+.screen img{display:block;width:100%;height:100%;object-fit:contain}
+.placeholder{position:absolute;inset:0;display:grid;place-content:center;color:#aaa}
+.status{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:8px;color:#aaa;min-height:18px}
+.error{margin-top:8px;color:#f99;white-space:pre-wrap;overflow-wrap:anywhere}
+.row{display:flex;gap:6px;margin-bottom:6px}
+button{font:inherit;color:inherit;background:#222;border:1px solid #555;padding:10px 8px;min-height:40px;cursor:pointer;touch-action:manipulation}
+button:hover{background:#333}
+button:active{background:#444}
+button[aria-pressed="true"]{border-color:#eee;background:#444}
+button:focus-visible{outline:2px solid #ddd;outline-offset:2px}
+button:disabled{opacity:.35;cursor:default}
+.row button{flex:1;min-width:0}
+.dial{margin:8px 0;color:#aaa}.dial>div:first-child{margin-bottom:4px}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:12px 0}
+.pad button{padding:0;aspect-ratio:1;font-size:18px}
+.pad button[data-key="ok"]{font-size:13px}
+.tools{display:flex;flex-wrap:wrap;gap:6px;margin-top:18px}
+.tools button{flex:1;white-space:nowrap}
+@media(max-width:600px){main{margin:8px auto;padding:0 8px}.layout{grid-template-columns:1fr}aside{display:grid;grid-template-columns:140px 140px;gap:6px;align-items:start}.row{margin:0}.pad{grid-column:2;grid-row:1/4;margin:0}.tools{grid-column:1/-1;margin-top:6px}}
+</style>
+<main>
+<div class="layout">
+<section aria-label="相机画面">
+  <div class="screen">
+    <img id="frame" alt="虚拟相机实时画面" hidden>
+    <div class="placeholder" id="placeholder"><span id="boot-message">连接中…</span></div>
+  </div>
+  <div class="status"><span id="status">启动中</span><span id="toast" aria-live="polite"></span></div>
+  <div class="status" id="raw-input" hidden></div>
+  <div class="error" id="capture-status" hidden>CMOS 初始化未完成，尚无传感器输入。</div>
+  <div class="error" id="error" hidden></div>
+</section>
+<aside aria-label="相机控制">
+  <div class="row"><button data-key="menu" title="M">MENU</button><button data-key="play" title="P">回放</button></div>
+  <div class="pad">
+    <span></span><button data-key="up" aria-label="上">↑</button><span></span>
+    <button data-key="left" aria-label="左或返回" title="← / Esc">←</button><button data-key="ok" title="Enter">OK</button><button data-key="right" aria-label="右">→</button>
+    <span></span><button data-key="down" aria-label="下">↓</button><span></span>
+  </div>
+  <div class="row"><button data-key="i" title="I">i</button><button data-key="delete" title="Delete">删除</button></div>
+  <div class="dial" style="font-size:12px">当前无镜头，调快门请选 M</div>
+  <div class="row" aria-label="曝光模式"><button data-key="mode_p">P</button><button data-key="mode_s">S</button><button data-key="mode_a">A</button><button data-key="mode_m">M</button></div>
+  <div class="dial" data-dial="main" aria-label="主拨轮"><div>主拨轮</div><div class="row"><button data-key="main_ccw" title="[" aria-label="主拨轮逆时针">↺</button><button data-key="main_cw" title="]" aria-label="主拨轮顺时针">↻</button></div></div>
+  <div class="dial" data-dial="sub" aria-label="副拨轮"><div>副拨轮</div><div class="row"><button data-key="sub_ccw" title="{" aria-label="副拨轮逆时针">↺</button><button data-key="sub_cw" title="}" aria-label="副拨轮顺时针">↻</button></div></div>
+  <div class="row"><button id="menu-profile">菜单启动</button><button id="shooting">拍摄启动</button></div>
+  <div class="tools"><button id="pause">暂停</button><button id="restart">重启</button><button id="stop">停止</button></div>
+</aside>
+</div>
+</main>
+<script>
+const token='__TOKEN__';let state={},frame=-1,fetching=false;const el=id=>document.getElementById(id);
+async function action(action,key){try{const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json','X-Z6-Token':token},body:JSON.stringify({action,key})});const j=await r.json();if(!r.ok)throw Error(j.error);el('toast').textContent=key?'按键已发送…':'操作已发送…';}catch(e){el('toast').textContent=e.message;}}
+document.querySelectorAll('[data-key]').forEach(b=>b.addEventListener('click',()=>action('key',b.dataset.key)));
+document.querySelectorAll('[data-dial]').forEach(d=>d.addEventListener('wheel',e=>{e.preventDefault();if(state.phase==='running'&&!state.busy&&e.deltaY)action('key',d.dataset.dial+(e.deltaY>0?'_cw':'_ccw'));},{passive:false}));
+el('pause').onclick=()=>action(state.phase==='paused'?'resume':'pause');el('restart').onclick=()=>action('restart');el('stop').onclick=()=>action('stop');
+for(const id of ['menu-profile','shooting'])el(id).onclick=()=>action(id);
+const keyboard={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',Enter:'ok',Escape:'left',m:'menu',M:'menu',p:'play',P:'play',i:'i',I:'i',Delete:'delete'};
+Object.assign(keyboard,{'[':'main_ccw',']':'main_cw','{':'sub_ccw','}':'sub_cw'});
+document.addEventListener('keydown',e=>{const key=keyboard[e.key];if(key&&!e.repeat&&state.phase==='running'&&!state.busy){e.preventDefault();action('key',key);}});
+async function poll(){if(fetching)return;fetching=true;try{const r=await fetch('/api/status');if(!r.ok)throw Error('连接失败');state=await r.json();el('status').textContent=state.message;el('boot-message').textContent=state.message;
+document.querySelectorAll('[data-key]').forEach(b=>b.disabled=state.phase!=='running'||state.busy);
+for(const [name,value] of Object.entries({mode_p:0,mode_a:1,mode_s:2,mode_m:3}))document.querySelector(`[data-key="${name}"]`).setAttribute('aria-pressed',String(state.exposure?.mode===value));el('pause').disabled=!['running','paused'].includes(state.phase)||state.busy;el('pause').textContent=state.phase==='paused'?'恢复':'暂停';el('restart').disabled=state.phase==='booting'||state.busy;el('stop').disabled=state.phase==='booting'||state.phase==='stopped'||state.busy;
+for(const id of ['menu-profile','shooting'])el(id).disabled=state.phase==='booting'||state.busy;
+el('error').hidden=!state.error;el('error').textContent=state.error||'';
+el('raw-input').hidden=!state.raw_input;
+if(state.device_evidence){const e=state.device_evidence;el('raw-input').textContent=`${e.raw_width}×${e.raw_height} ${e.raw_bits} bit · 输入 ${e.raw_batches} 批 · 处理 ${e.isp_batches} 批 · ${e.processed_buffer_scanned?'LCD 已读取处理结果':'等待 LCD'}`;}
+else if(state.raw_input){const raw=state.raw_input;el('raw-input').textContent=`RAW 测试源（Z6 输入格式未确认）：${raw.width}×${raw.height} ${raw.cfa} ${raw.sample_bits} bit · 已校验 ${raw.validated_frames} 帧 · 传入虚拟机 ${raw.guest_frames_transferred} 帧 · 固件消费 ${raw.firmware_frames_consumed} 帧`;}
+el('capture-status').hidden=!state.capture;
+el('capture-status').textContent=state.device_evidence?'无镜头 · 实验性传感器和图像处理':(state.no_lens_simulation?'无镜头模拟 · ':'')+(state.capture?.control_test?'控制链实验：使用模拟握手和测试脉冲；RAW 0 帧，尚未接入 CMOS。':'CMOS 初始化未完成，尚无传感器输入。');
+if(state.phase==='booting'){el('frame').hidden=true;el('placeholder').hidden=false;frame=-1;}
+if(state.frame&&frame!==state.frame){const response=await fetch('/api/frame?v='+state.frame);if(response.ok){const url=URL.createObjectURL(await response.blob());const img=el('frame'),old=img.src;img.onload=()=>{if(old.startsWith('blob:'))URL.revokeObjectURL(old);};img.src=url;img.hidden=false;el('placeholder').hidden=true;frame=state.frame;}}
+if(state.last_key&&!state.busy)el('toast').textContent='按键：'+state.last_key;
+}catch(e){el('status').textContent='连接中断';document.querySelectorAll('button').forEach(b=>b.disabled=true);}finally{fetching=false;setTimeout(poll,document.hidden?1000:state.phase==='running'?120:500);}}
+poll();
+</script>
+</html>
