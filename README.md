@@ -1,6 +1,6 @@
 # WonderLantern Z6 QEMU
 
-[中文](README.zh-CN.md) · [Build](docs/build.md) · [Firmware](docs/firmware.md) · [Architecture](docs/architecture.md) · [Testing](docs/testing.md)
+[中文](README.zh-CN.md) · [Build](docs/build.md) · [Firmware](docs/firmware.md) · [Architecture](docs/architecture.md) · [Usage](docs/usage.md) · [Debugging](docs/debugging.md) · [Testing](docs/testing.md) · [Publication](docs/publication.md)
 
 Experimental Nikon Z6 C 3.80 machine for QEMU 10.2.4, with a local browser controller, firmware-rendered menus, synthetic RAW → functional ISP → LCD, native grid scanout and main/sub command-dial inputs.
 
@@ -11,6 +11,8 @@ Experimental Nikon Z6 C 3.80 machine for QEMU 10.2.4, with a local browser contr
 Linux or WSL, Python 3.12+:
 
 ```sh
+git clone https://github.com/WonderLantern/z6-qemu.git
+cd z6-qemu
 sudo apt-get update
 sudo apt-get install build-essential ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev zlib1g-dev libfdt-dev
 python3 -m venv .venv
@@ -29,7 +31,7 @@ Compatible input is the extracted Z6 C 3.80 MAIN: **33,502,842 bytes**, SHA-256 
 
 The local baseline has shown original 1024×682 menus, continuous synthetic RAW/ISP/LCD output, d9 grid lines and M-mode shutter changes 1/8000 → 1/6400 → 1/5000, with reverse input restoring the previous value. The export is tested separately; see [testing](docs/testing.md).
 
-The default profile has no lens. Selecting S currently still displays A and does not adjust Tv; use M for shutter tests. The cause is not fully traced. Sub-wheel input is connected, but aperture changes are unverified without a lens. Returning from menus to continuous live view still requires **Shooting start**, which recreates the guest. Mode/grid settings are retained within the server session; shutter settings are not retained across guest recreation.
+The default profile has no lens. Selecting S currently still displays A and does not adjust Tv; use M for shutter tests. The cause is not fully traced. Sub-wheel input is connected, but aperture changes are unverified without a lens. Returning from menus to continuous live view still requires **Shooting start**, which recreates the guest. The server remembers mode/grid settings: grid is restored during guest recreation, and exposure mode is reapplied after shooting startup succeeds. Shutter settings are not retained across guest recreation.
 
 This is an experimental functional model. It does not prove physical CMOS protocol, Nikon ISP algorithms, AF, physical exposure duration, photo saving, movie encoding or shutter-sound behavior. It runs on your computer and is not a camera-flashable package.
 
@@ -45,6 +47,18 @@ sh tests/run.sh
 python tests/test_irq99.py --qemu .build/build/qemu-system-arm
 python tools/verify_release.py
 ```
+
+## Documentation map
+
+| Guide | Contents |
+| --- | --- |
+| [Build](docs/build.md) | Dependencies, pinned archive, offline build, WSL and build errors |
+| [Firmware input](docs/firmware.md) | Accepted MAIN, checks and modified-input flag |
+| [Usage](docs/usage.md) | Launch profiles, keys, dials, scene replacement and session behavior |
+| [Architecture](docs/architecture.md) | Z6 profile, assisted startup, image path, grid and upstream changes |
+| [Debugging](docs/debugging.md) | Session status, diagnostic calls and capture evidence |
+| [Testing](docs/testing.md) | Synthetic checks and dated export verification |
+| [Publication](docs/publication.md) | Source inventory, local-output boundary and attribution |
 
 ## Acknowledgements
 

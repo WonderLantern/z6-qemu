@@ -1,6 +1,8 @@
-# Validation of this export
+# Tests and export validation
 
 The public export is validated separately from the working research directory. No original firmware or generated runtime output is part of the source inventory/ZIP.
+
+## Recorded export verification
 
 2026-10-09: the exported overlay was applied to a clean extraction of the hash-verified QEMU10.2.4 archive, configured and compiled in a separate build cache. All1363 build targets completed successfully. The input archive was supplied from a local cache; the download branch was not exercised in this run.
 
@@ -10,4 +12,36 @@ Firmware-free QTest passed all five checks: pending RAW IRQ99 enable/W1C behavio
 
 The working baseline has shown original menus/live view/grid and M-mode Tv312→304→296, with display tuples(192,2496)→(192,2432)→(192,2368), corresponding to1/8000→1/6400→1/5000. The independent export binary also booted original live view, changed M-mode312→304 with its matching LCD1/6400, and entered the original playback menu. That smoke test used a local official firmware input; logs/screenshots remain outside the public inventory. It is separate from synthetic tests and CI, which never load Nikon firmware.
 
-No physical camera, card, exposure duration, recording, AF, sound, movie encoder or complete hardware behavior is verified by these export tests. The GitHub workflow is provided but has not been executed remotely as part of preparing this package.
+No physical camera, card, exposure duration, recording, AF, sound, movie encoder or complete hardware behavior is verified by these export tests. At the time of the original 2026-10-09 package preparation, the GitHub workflow had not been executed remotely. This dated record does not establish the current Actions status.
+
+## Run the firmware-free checks
+
+From the repository root with dependencies installed:
+
+```sh
+python tools/verify_release.py
+sh tests/run.sh
+python tools/make_cmos.py
+python tests/test_irq99.py --qemu .build/build/qemu-system-arm
+```
+
+The QTest command requires a built emulator. With a separate build cache, pass its `qemu-system-arm` path instead.
+
+| Check | What it exercises |
+| --- | --- |
+| `verify_release.py` | Declared source inventory and byte hashes |
+| `test_inputs.py` | Synthetic RAW input contracts |
+| `test_lcd_grid.py` | Actual grid renderer under ASan/UBSan |
+| `test_isp.c` through `run.sh` | Functional ISP pixel checks under ASan/UBSan |
+| `make_cmos.py` | Generated Bayer packing round trips |
+| `test_irq99.py` | Pending completion IRQ mask/W1C, SDES readback, grid enable and Z6 machine/memory isolation |
+
+The GitHub workflow contains dependency installation, source checks, synthetic tests, input generation, a pinned QEMU build and QTest. It supplies no Nikon firmware.
+
+## Firmware-dependent reproduction
+
+The documented independent export smoke test used the accepted official MAIN, the exported binary and a local browser session. Its observed results were original live view, M-mode main-dial Tv312 to Tv304 with LCD 1/8000 to 1/6400, and entry into the original playback menu.
+
+For comparison runs, record the firmware and binary hashes, profile, RAW manifest, mode, starting value, exact input and resulting native readback/display. A successful build or register assertion alone does not establish the displayed camera behavior.
+
+The working-baseline results and independent-export results above have different scopes. The original local screenshots and logs remain outside the public source inventory.
