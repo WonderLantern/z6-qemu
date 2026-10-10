@@ -22,3 +22,4 @@ jobs:
           . .venv/bin/activate
           python tools/build.py --jobs 4
           python tests/test_irq99.py --qemu .build/build/qemu-system-arm
+          python tests/test_counter_timing.py --qemu .build/build/qemu-system-arm

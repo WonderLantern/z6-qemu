@@ -24,6 +24,7 @@ import time
 import zlib
 
 import probe
+import focus_display
 from probe import call_fixture, Remote
 from capture_diagnostics import action_completed, capture_health, capture_state
 
@@ -57,11 +58,11 @@ DIALS = {'main_cw': (0x10, 1), 'main_ccw': (0x10, -1),
          'sub_cw': (0x14, 1), 'sub_ccw': (0x14, -1)}
 # Physical selector DSID0; runtime readback matches 136F: P/A/S/M=0/1/2/3.
 MODES = {'mode_p': 0, 'mode_s': 2, 'mode_a': 1, 'mode_m': 3}
-LABELS = {'half': '返回取景', 'right': '右', 'left': '左 / 返回', 'up': '上', 'down': '下',
+LABELS = {**{k:k for k in focus_display.KEYS}, 'half': '返回取景', 'right': '右', 'left': '左 / 返回', 'up': '上', 'down': '下',
           'menu': 'MENU', 'play': '回放', 'delete': '删除', 'i': 'i', 'ok': 'OK',
           'main_cw': '主拨轮顺时针', 'main_ccw': '主拨轮逆时针',
           'sub_cw': '副拨轮顺时针', 'sub_ccw': '副拨轮逆时针',
-          'mode_p': 'P档', 'mode_s': 'S档', 'mode_a': 'A档', 'mode_m': 'M档'}
+          'counter_probe': '计时自检', 'capture': '拍照', 'mode_p': 'P档', 'mode_s': 'S档', 'mode_a': 'A档', 'mode_m': 'M档'}
 
 
 def ppm_pixels(data):
@@ -125,10 +126,11 @@ class Camera:
                  exmcu_no_lens=False, orientation_fixture=None, keep_awake=False,
                  tg_periodic_test=False, raw_ingress_test=None, tg_paired_test=False, isp_boundary_test=False,
                  photo_liveview=False, one_insn_per_tb=False,
-                 allow_modified_firmware=False, firmware_sha256=None):
+                 allow_modified_firmware=False, firmware_sha256=None, exposure_probe=False, companion_firmware=None):
         # Fail before launching QEMU if any selected input is malformed.
         self.raw_source = RawSequence(raw_source) if raw_source else None
         self.port = port
+        self.exposure_probe = exposure_probe
         self.allow_modified_firmware = allow_modified_firmware
         self.firmware_sha256 = firmware_sha256 or OFFICIAL_FIRMWARE_SHA256
         self.session_grid_setting = None
@@ -160,6 +162,9 @@ class Camera:
             raise ValueError('Orientation must be 0, 1, 2 or 3')
         self.orientation_fixture = orientation_fixture
         self.keep_awake = keep_awake
+        self.focus_state = {'enabled':False,'mode':'S','status':'idle','center':[360,240],'simulated':True}
+        self.focus_code = 0
+        self.focus_rect = None
         self.token = secrets.token_urlsafe(24)
         self.lock = threading.Lock()
         self.requests = queue.Queue(maxsize=16)
@@ -169,6 +174,20 @@ class Camera:
                       'orientation_fixture': self.orientation_fixture,
                       'keep_awake': self.keep_awake, 'idle_timeout_override': None}
         self.png = None
+        self.shoulder_png = None
+        self.shoulder_renderer = None
+        self.shoulder_log_position = 0
+        self.shoulder_log_tail = ''
+        self.shoulder_packets = 0
+        try:
+            from shoulder_display import ShoulderDisplay
+            if companion_firmware is None:
+                raise ValueError('Shoulder display disabled; provide --companion-firmware')
+            self.shoulder_renderer = ShoulderDisplay(companion_firmware)
+            self.state['shoulder'] = dict(available=True, frame=0, packets=0,
+                message='等待原厂肩屏数据', **self.shoulder_renderer.evidence())
+        except (ImportError, OSError, ValueError) as exc:
+            self.state['shoulder'] = dict(available=False, frame=0, message=str(exc))
         self.previous_pixels = None
         self.proc = self.remote = self.monitor = self.console = None
         self.running = False
@@ -197,7 +216,9 @@ class Camera:
             f.write(json.dumps(dict(time=time.time(), **record), ensure_ascii=False)+'\n')
 
     def submit(self, action, key=None):
-        if action not in ('key', 'pause', 'resume', 'restart', 'stop', 'shooting', 'menu-profile') or (action == 'key' and key not in {*KEYS, *DIALS, *MODES}):
+        if key in ('capture', 'counter_probe') and not self.exposure_probe:
+            raise ValueError('Capture probe requires --exposure-probe')
+        if action not in ('key', 'pause', 'resume', 'restart', 'stop', 'shooting', 'menu-profile') or (action == 'key' and key not in {*KEYS, *DIALS, *MODES, *focus_display.KEYS, 'capture', 'counter_probe'}):
             raise ValueError('未知按键或操作')
         with self.lock:
             if self.state['phase'] == 'booting':
@@ -294,7 +315,146 @@ class Camera:
         self.update(exposure=after)
         return packet
 
+    def counter_driver_probe(self, packet, time_pair=(192, -960), expected_ns=32000000000):
+        """Original converter/driver experiment, separate from still exposure.
+
+        It uses an idle counter with masked IRQ, then stops and restores it.
+        Deadline expiration is tested separately with QTest virtual time.
+        """
+        converted = call_fixture(self.remote, packet, 0x1011c14a,
+                                 struct.pack('<ii', *time_pair), [('scratch', 0)])
+        packet = 'T05thread:'+converted['return_cpu']+';'
+        ns = int(converted['return_r0'], 16) | (int(converted['return_r1'], 16) << 32)
+        if ns != expected_ns:
+            raise RuntimeError(f'Converter returned {ns}ns, expected {expected_ns}ns')
+        # +21 is a declared zero-calibration fixture, NOT decoded sensor timing.
+        ticks = ns // 1000 + 21
+        enable = int.from_bytes(self.remote.memory(0x2c011000, 4), 'little')
+        irq_mask = int.from_bytes(self.remote.memory(0x2c01100c, 4), 'little')
+        selected = None
+        candidates = []
+        for ch in range(11, -1, -1):
+            if enable & (1 << ch):
+                continue
+            obj = 0xc1806390 + 0x14 * ch
+            data = self.remote.memory(obj, 20)
+            table = struct.unpack_from('<I', data, 8)[0]
+            candidates.append({'channel': ch, 'object': data.hex(), 'table': hex(table)})
+            if data[4] != ch or not (0xa1800000 <= table < 0xa4000000 or 0xc1800000 <= table < 0xc4000000):
+                continue
+            base = 0x2c011100 + ch * 0x100
+            pointers = struct.unpack('<23I', self.remote.memory(table, 92))
+            if pointers[8] != base+8:
+                continue
+            pending = int.from_bytes(self.remote.memory(0x2c010110+ch*0x100, 4), 'little')
+            if pending:
+                continue
+            selected = (ch, obj, base, data)
+            break
+        if selected is None:
+            self.audit({'kind': 'counter-driver-candidates', 'candidates': candidates})
+            raise RuntimeError('No initialized idle counter available for driver probe')
+        ch, obj, base, data = selected
+        saved_clock, saved_terminal, saved_count = struct.unpack('<3I', self.remote.memory(base+4, 12))
+        callback = struct.unpack_from('<I', data, 16)[0]
+        saved_cfg = struct.pack('<5I', saved_count, saved_terminal, saved_clock, 1, 1)
+        cfg = struct.pack('<5I', (-ticks) & 0xffffffff, 0xffffffff, 0x31, 1, 1)
+        record = {'scope': 'firmware converter and original counter driver fixture',
+                  'time_pair': list(time_pair), 'expected_ns': expected_ns,
+                  'converter_ns': ns, 'calibration_fixture': 0, 'compensation_us_fixture': 21,
+                  'ticks': ticks, 'tick_ns_hypothesis': 1000, 'channel': ch,
+                  'object': hex(obj), 'config': cfg.hex(),
+                  'sensor_integration_verified': False, 'firmware_capture_verified': False}
+        armed = False
+        try:
+            packet = self.call(packet, '屏蔽自检通道中断', 0x1005b354, bytes(8), [obj])
+            packet = self.call(packet, '提交原厂计数器配置', 0x1005b3ba, cfg,
+                               [obj, ('scratch', 0), 0])
+            armed = True
+            packet = self.call(packet, '启动原厂计数器', 0x1005b376, bytes(8), [obj])
+            armed = True
+            active = int.from_bytes(self.remote.memory(0x2c011000, 4), 'little')
+            registers = struct.unpack('<3I', self.remote.memory(base+4, 12))
+            record.update(enabled=bool(active & (1 << ch)), clock=registers[0],
+                          terminal=registers[1], observed_count=registers[2])
+            if not record['enabled'] or record['clock'] != 0x31 or record['terminal'] != 0xffffffff:
+                raise RuntimeError('Original counter driver did not program expected registers')
+        finally:
+            if armed:
+                packet = self.call(packet, '停止自检计数器', 0x1005b398, bytes(8), [obj])
+            packet = self.call(packet, '还原自检通道配置', 0x1005b3ba, saved_cfg,
+                               [obj, ('scratch', 0), callback])
+            packet = self.call(packet, '还原自检中断屏蔽',
+                               0x1005b354 if irq_mask & (1 << ch) else 0x1005b332,
+                               bytes(8), [obj])
+        restored_enable = int.from_bytes(self.remote.memory(0x2c011000, 4), 'little')
+        record['restored_inactive'] = not bool(restored_enable & (1 << ch))
+        if not record['restored_inactive']:
+            raise RuntimeError('Counter probe left a running channel')
+        self.audit({'kind': 'native-counter-driver-probe', **record})
+        self.update(counter_probe=record)
+        return packet
+
+    def capture_probe(self, packet):
+        """Physical release switches; observation only, never a completion fixture."""
+        packet, exposure_before = self.exposure_observation(packet)
+        health_before = capture_health(self.remote, self.device_evidence or None)
+        snapshot = call_fixture(self.remote, packet, 0x101b640c,
+                                bytes(48), [('scratch', 0)])
+        packet = 'T05thread:'+snapshot['return_cpu']+';'
+        original = bytearray.fromhex(snapshot['output'])
+        for offset in (0x10, 0x14, 0x18, 0x1c):
+            struct.pack_into('<i', original, offset, 0)
+        initial = struct.unpack_from('<I', original)[0]
+        if initial & 0xc0000000:
+            raise RuntimeError('Release switches already pressed; refuse probe')
+        events = []
+        # Bounded original entry observations; no service-return interception.
+        probe_points = [0x103265ac, 0x103265b2, 0x103265c8, 0x103265cc, 0x10326632, 0x103266aa, 0x1030fdaa, 0x1030fdde, 0x103264f2, 0x10326532, 0x1032653a, 0x1032654c, 0x10326568, 0x103265a8, 0x103265b8, 0x1033965c, 0x1030f60e, 0x10378a40, 0x1033938a, 0x103393b4, 0x103393dc, 0x10339da0, 0x10339484, 0x10334fdc, 0x10335028, 0x1033423a, 0x103343e2, 0x103345f6, 0x103346da, 0x10335d2a, 0x10334196, 0x10334bf8, 0x10334c14, 0x10335e04, 0x103687a0, 0x1008fe80, 0x1008fca2, 0x1015bcd2, 0x1020d98c, 0x1005d42e, 0x101b6394, 0x10061672, 0x100621c0, 0x10061810, 0x1006157e, 0x1016585e, 0x1011c14a, 0x100cda34,
+                        0x1005b3ba, 0x1005b376]
+        dispatch_callback = int(health_before['gui_action_dispatch']['callback'], 16)
+        if 0x10020000 <= (dispatch_callback & ~1) < 0x12020000:
+            probe_points.append(dispatch_callback & ~1)
+        client = int(health_before['application']['pointer'], 16)
+        callback = int.from_bytes(self.remote.memory(client+8, 4), 'little')
+        if 0x10020000 <= (callback & ~1) < 0x12020000:
+            probe_points.append(callback & ~1)
+        previous_trace = list(probe.TRACE_CALL)
+        probe.TRACE_CALL.extend(point for point in probe_points if point not in probe.TRACE_CALL)
+        try:
+            for label, mask, settle in [
+                ('半按快门', 0x80000000, 100),
+                ('全按快门', 0xc0000000, 100),
+                ('释放全按', 0x80000000, 100),
+                ('释放半按', 0, 500),
+            ]:
+                report = bytearray(original)
+                struct.pack_into('<I', report, 0, initial | mask)
+                packet = self.call(packet, label, 0x101b63e6, report, [('scratch', 0)])
+                packet = self.call(packet, '等待快门输入处理', 0x10170cca, bytes(8), [settle])
+                events.append({'switch_mask': hex(mask),
+                               'live_report': self.remote.memory(0xc1f90df8, 48).hex(),
+                               'sampled_report': self.remote.memory(0xc1f90ca8, 0x64).hex(),
+                               'capture': capture_health(self.remote, self.device_evidence or None)})
+        finally:
+            probe.TRACE_CALL[:] = previous_trace
+        packet, exposure_after = self.exposure_observation(packet)
+        result = {'before': health_before, 'exposure_before': exposure_before,
+                  'events': events, 'after': events[-1]['capture'],
+                  'exposure_after': exposure_after,
+                  'physical_input_submitted': True, 'exposure_completed': None,
+                  'timing_verified': False, 'firmware_code_modified': False}
+        self.audit({'kind': 'physical-capture-probe', **result})
+        self.update(capture_probe=result)
+        return packet
+
     def key(self, packet, name):
+        if name in focus_display.KEYS:
+            return focus_display.apply(self,packet,name)
+        if name == 'counter_probe':
+            return self.counter_driver_probe(packet)
+        if name == 'capture':
+            return self.capture_probe(packet)
         if name in DIALS or name in MODES:
             return self.dial_or_mode(packet, name)
         before = {'live': self.remote.memory(0xc1f90dfc, 4).hex(),
@@ -362,6 +522,8 @@ class Camera:
         return packet
 
     def boot(self, enter_menu=True, announce_ready=True):
+        if os.environ.get('WSL_DISTRO_NAME') == 'ubuntu-noble':
+            raise RuntimeError('Use the explicitly selected Nikon distribution')
         self.frame_spool = Path(tempfile.gettempdir())/'nikon-z6'/self.stamp
         self.frame_spool.mkdir(parents=True, exist_ok=True)
         self.boot_started = time.perf_counter()
@@ -369,6 +531,12 @@ class Camera:
             self.raw_source = RawSequence(self.raw_source.path)
             self.update(raw_input=self.raw_source.status())
         self.boot_count += 1
+        self.shoulder_log_position = 0
+        self.shoulder_log_tail = ''
+        self.shoulder_packets = 0
+        with self.lock:
+            self.shoulder_png = None
+            self.state['shoulder'].update(frame=0, packets=0)
         self.device_log_position = 0
         self.device_log_tail = ''
         self.preview_buffers.clear()
@@ -378,7 +546,7 @@ class Camera:
             'raw_batches': 0, 'isp_batches': 0, 'lcd_frames_observed': 0,
             'processed_buffer_scanned': False} if self.photo_liveview else {}
         self.update(phase='booting', message='正在加载原固件', busy=True, error=None, frame=0,
-                    capture=None, profile=self.profile, idle_timeout_override=None,
+                    capture=None, exposure_probe_enabled=self.exposure_probe, profile=self.profile, idle_timeout_override=None,
                     device_evidence=dict(self.device_evidence), frame_sha256=None)
         with self.lock:
             self.png = self.previous_pixels = None
@@ -406,6 +574,8 @@ class Camera:
         self.live_log = self.frame_spool/f'qemu-{self.boot_count}.log'
         self.console = self.live_log.open('w')
         env = dict(os.environ, Z6_MMIO_QUIET='1')
+        if self.exposure_probe:
+            env['Z6_TRACE_EXPOSURE'] = '1'
         env.pop('Z6_IMAGE_CONFIG_RECORD', None)
         env.pop('Z6_IMAGE_PROCESS_TEST', None)
         env.pop('Z6_ISP_DISABLE_CACHE', None)
@@ -579,6 +749,8 @@ class Camera:
         The optional control test supplies a TG test pulse and two EX MCU
         control replies. It does not supply a complete sensor config or pixels.
         """
+        self.focus_code = 0
+        self.focus_rect = None
         self.boot(enter_menu=False, announce_ready=False)
         self.update(phase='booting', busy=True, message='正在启动拍摄界面')
         self.pause()
@@ -660,7 +832,9 @@ class Camera:
         self.audit({'kind': 'capture_start', 'result': result, 'health': health})
         if not health['start_lv_action_completed']:
             raise RuntimeError('StartLV 动作未完成；详见本次运行日志')
-        self.update(capture=health)
+        self.update(capture=health,focus=dict(self.focus_state))
+        if self.focus_state['enabled']:
+            packet = focus_display.apply(self,packet)
         self.refresh()
         (self.directory/'shooting-entry.png').write_bytes(self.png)
         self.continue_guest()
@@ -674,6 +848,47 @@ class Camera:
                 return f"取景实验 · RAW {e.get('raw_batches', 0)} 批 · 处理 {e.get('isp_batches', 0)} 批"
             return '控制链实验 · RAW 0 帧' if self.capture_control_test else '运行中 · CMOS 未就绪'
         return '运行中'
+
+    def refresh_shoulder(self):
+        if self.shoulder_renderer is None:
+            return
+        import re
+        from shoulder_display import rgb
+        with self.live_log.open('r') as stream:
+            stream.seek(self.shoulder_log_position)
+            data = self.shoulder_log_tail + stream.read()
+            self.shoulder_log_position = stream.tell()
+        lines = data.split('\n')
+        self.shoulder_log_tail = lines.pop()
+        packets = []
+        for line in lines:
+            match = re.fullmatch(r'Z6_SHOULDER_PACKET channel=8 length=112 sequence=(\d+) data=([0-9a-f]{224})', line)
+            if match:
+                packets.append((int(match[1]), bytes.fromhex(match[2])))
+        if not packets:
+            return
+        self.shoulder_packets += len(packets)
+        sequence, payload = packets[-1]
+        try:
+            frame = self.shoulder_renderer.receive(payload)
+            png = rgb_png(128, 96, rgb(frame))
+            (self.directory/'shoulder.bin').write_bytes(frame)
+            (self.directory/'shoulder.png').write_bytes(png)
+            (self.directory/'shoulder-payload.bin').write_bytes(payload)
+            evidence = dict(available=True, frame=self.shoulder_packets,
+                packets=self.shoulder_packets, sequence=sequence,
+                message='原厂肩屏快照 → 原生 MCU 绘图',
+                framebuffer_sha256=hashlib.sha256(frame).hexdigest(),
+                payload_sha256=hashlib.sha256(payload).hexdigest(),
+                lit_pixels=sum(byte.bit_count() for byte in frame),
+                **self.shoulder_renderer.evidence())
+            with self.lock:
+                self.shoulder_png = png
+                self.state['shoulder'] = evidence
+            (self.directory/'shoulder-evidence.json').write_text(json.dumps(evidence, indent=2))
+        except Exception as exc:
+            self.update(shoulder=dict(available=False, frame=0,
+                        message='肩屏绘图失败：'+str(exc)))
 
     def refresh_device_evidence(self):
         """Read new device log lines only; counters never infer physical accuracy."""
@@ -736,6 +951,7 @@ class Camera:
         if self.running and not status['running']:
             raise RuntimeError('虚拟机已停止：'+status['status'])
         self.refresh_device_evidence()
+        self.refresh_shoulder()
         if not self.running and self.state.get('capture') is not None:
             # Publish a fresh paused observation instead of retaining boot state.
             health = dict(self.state['capture'])
@@ -861,6 +1077,7 @@ def main():
     global FIRMWARE, BUILD_MANIFEST
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--firmware', type=Path, required=True, help='Your locally obtained extracted Z6 C3.80 MAIN')
+    p.add_argument('--companion-firmware', type=Path, help='Optional locally supplied verified companion-MCU image for shoulder display')
     p.add_argument('--build-manifest', type=Path, default=BUILD_MANIFEST)
     p.add_argument('--port', type=int, default=8787)
     p.add_argument('--one-insn-per-tb', action=argparse.BooleanOptionalAction, default=False,
@@ -877,6 +1094,8 @@ def main():
                    help='Fixed orientation through original firmware API; 0 is landscape, not an IMU model')
     p.add_argument('--keep-awake', action='store_true',
                    help='Disable shooting idle timeout through native setting 1021=0; session only')
+    p.add_argument('--exposure-probe', action='store_true',
+                   help='Enable physical full-release input and passive timing traces; no exposure completion fixture')
     p.add_argument('--no-current', action='store_true', help='Do not replace the primary session pointer')
     p.add_argument('--raw-source', type=Path,
                    help='Unpacked Bayer manifest; defaults to active_cmos.json')
@@ -922,7 +1141,8 @@ def main():
                     keep_awake=a.keep_awake or a.photo_liveview, photo_liveview=a.photo_liveview,
                     one_insn_per_tb=a.one_insn_per_tb,
                     allow_modified_firmware=a.allow_modified_firmware,
-                    firmware_sha256=firmware_sha256)
+                    firmware_sha256=firmware_sha256, exposure_probe=a.exposure_probe,
+                    companion_firmware=a.companion_firmware)
     camera.isp_disable_cache = a.isp_disable_cache
     camera.tg_period_ms = a.tg_period_ms
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -952,6 +1172,10 @@ def main():
                 with camera.lock:
                     png = camera.png
                 self.send(200 if png else 503, png or b'Frame not ready', 'image/png' if png else 'text/plain')
+            elif path == '/api/shoulder':
+                with camera.lock:
+                    png = camera.shoulder_png
+                self.send(200 if png else 503, png or b'Shoulder not ready', 'image/png' if png else 'text/plain')
             elif path == '/favicon.ico':
                 self.send(204, b'')
             else:

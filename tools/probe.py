@@ -79,7 +79,13 @@ def call_fixture(remote, packet, function, payload, arguments, services=None, th
         for register in ['r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7', 'r13']:
             pointer = int(after[register], 16)
             if (0xa1800000 <= pointer <= 0xac400000 - 128 or 0xc0000000 <= pointer <= 0xffffffff - 128):
-                event['memory'][register] = remote.memory(pointer, 128).hex()
+                # A signed scalar (for example a negative Tv) can resemble a
+                # high RAM pointer. An unreadable trace candidate must not
+                # abort the guest call or leave its breakpoints installed.
+                try:
+                    event['memory'][register] = remote.memory(pointer, 128).hex()
+                except ValueError as exc:
+                    event.setdefault('unreadable_memory', {})[register] = str(exc)
         trace.append(event)
         if watched:
             address, length = watched
@@ -119,6 +125,6 @@ def call_fixture(remote, packet, function, payload, arguments, services=None, th
     return {'function': hex(function), 'instruction_set': 'Thumb' if thumb else 'ARM',
             'payload': payload.hex(), 'output': output.hex(),
             'arguments': [hex(v) if isinstance(v, int) else {'scratch_offset': v[1]} for v in arguments],
-            'return_r0': after['r0'], 'call_cpu': thread, 'return_cpu': return_thread,
+            'return_r0': after['r0'], 'return_r1': after['r1'], 'call_cpu': thread, 'return_cpu': return_thread,
             'trace': trace,
             'kind': 'synthetic diagnostic input; not a controller protocol model'}

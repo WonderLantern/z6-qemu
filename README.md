@@ -6,6 +6,10 @@ Experimental Nikon Z6 C 3.80 machine for QEMU 10.2.4, with a local browser contr
 
 **Bring your own firmware.** This source package contains no Nikon firmware, decrypted payload, camera dump, key, calibration, extracted fonts/icons or firmware-rendered screenshots. The tools do not download firmware.
 
+## New display and counter support
+
+This preview adds optional original companion-MCU shoulder rendering, S/L focus-frame diagnostics, native LCD second-plane composition and CAPTG counter tests. [Setup and scope](docs/display-counter.md) explains the optional firmware/dependency inputs and RAM helper build. Focus colors are injected diagnostic states; counter completion is not a completed photograph.
+
 ## Quick start
 
 Linux or WSL, Python 3.12+:
@@ -45,6 +49,7 @@ This is an experimental functional model. It does not prove physical CMOS protoc
 ```sh
 sh tests/run.sh
 python tests/test_irq99.py --qemu .build/build/qemu-system-arm
+python tests/test_counter_timing.py --qemu .build/build/qemu-system-arm
 python tools/verify_release.py
 ```
 
@@ -57,6 +62,7 @@ python tools/verify_release.py
 | [Usage](docs/usage.md) | Launch profiles, keys, dials, scene replacement and session behavior |
 | [Architecture](docs/architecture.md) | Z6 profile, assisted startup, image path, grid and upstream changes |
 | [Debugging](docs/debugging.md) | Session status, diagnostic calls and capture evidence |
+| [Display and counters](docs/display-counter.md) | Optional shoulder setup, AF helper and counter probes |
 | [Testing](docs/testing.md) | Synthetic checks and dated export verification |
 | [Publication](docs/publication.md) | Source inventory, local-output boundary and attribution |
 

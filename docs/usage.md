@@ -78,3 +78,9 @@ All use RGGB, black level 64 and white level 4095. Packing is checked by decodin
 Use `python tools/interactive.py --help` for the complete parser. Diagnostic switches are implementations, not additional device validation results.
 
 The HTTP server, GDB endpoint and QMP endpoint bind to `127.0.0.1`. Stop the launcher with Ctrl+C; its shutdown path closes the guest.
+
+## Additional displays and probes
+
+The shoulder display uses an optional `--companion-firmware` input and Unicorn. S/L focus controls require a separately compiled RAM drawing helper. See [display and counter setup](display-counter.md) for both.
+
+`--exposure-probe` enables the diagnostic full-release and counter controls. The default interface does not enable these probes. Neither their presence nor a counter terminal event establishes a saved photograph.

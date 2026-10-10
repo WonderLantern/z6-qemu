@@ -25,6 +25,9 @@ def capture_health(remote, image_evidence=None):
     inhibits = int.from_bytes(remote.memory(0xc2376d60, 16), 'little')
     parameter_init = int.from_bytes(remote.memory(0xc18b6230, 4), 'little')
     pointer = int.from_bytes(remote.memory(0xc18fa968, 4), 'little')
+    gui_mode = remote.memory(0xc1829b20, 1)[0]
+    gui_action_object = int.from_bytes(remote.memory(0xc2020a98+4*gui_mode, 4), 'little') if gui_mode < 8 else 0
+    gui_action_callback = int.from_bytes(remote.memory(gui_action_object+0x14, 4), 'little') if 0xc0000000 <= gui_action_object < 0xff000000 else 0
     version = None
     raw = None
     if pointer:
@@ -35,6 +38,17 @@ def capture_health(remote, image_evidence=None):
             'prepro_wait_input': hex(int.from_bytes(remote.memory(0xc25ed3b8, 4), 'little')),
             'error_flags': hex(flags), 'error_active': active,
             'capture_failed': bool(flags and active),
+            'release_inhibit_submask': hex(int.from_bytes(remote.memory(0xc18b8ab8, 4), 'little')),
+            'gui_action_dispatch': {'mode': gui_mode, 'object': hex(gui_action_object), 'callback': hex(gui_action_callback)},
+            'liveview_input_queue': remote.memory(0xc1821334, 0x30).hex(),
+            'input_client_gate': {'enabled': int.from_bytes(remote.memory(0xc1815c54, 4), 'little'),
+                                  'ready': int.from_bytes(remote.memory(0xc1815c58, 4), 'little'),
+                                  'clients': remote.memory(0xc1815c64, 0x4c).hex(),
+                                  'state': remote.memory(0xc1815cb8, 16).hex()},
+            'physical_input_callback': hex(int.from_bytes(remote.memory(0xc1815a74, 4), 'little')),
+            'physical_input_callback_arg': hex(int.from_bytes(remote.memory(0xc1815a78, 4), 'little')),
+            'release_callback': hex(int.from_bytes(remote.memory(0xc1882bf0, 4), 'little')),
+            'release_context': remote.memory(0xc2376e04, 0x48).hex(),
             'active_inhibit_ids': [hex(bit) for bit in range(97) if inhibits & (1 << bit)],
             'parameter_initialization_pending_mask': hex(parameter_init),
             'parameter_refresh_enabled': parameter_init == 0,

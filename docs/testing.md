@@ -23,6 +23,7 @@ python tools/verify_release.py
 sh tests/run.sh
 python tools/make_cmos.py
 python tests/test_irq99.py --qemu .build/build/qemu-system-arm
+python tests/test_counter_timing.py --qemu .build/build/qemu-system-arm
 ```
 
 The QTest command requires a built emulator. With a separate build cache, pass its `qemu-system-arm` path instead.
@@ -32,6 +33,8 @@ The QTest command requires a built emulator. With a separate build cache, pass i
 | `verify_release.py` | Declared source inventory and byte hashes |
 | `test_inputs.py` | Synthetic RAW input contracts |
 | `test_lcd_grid.py` | Actual grid renderer under ASan/UBSan |
+| `test_lcd_overlay.py` | Actual LCD region/bank composition under ASan/UBSan |
+| `test_counter_timing.py` | Virtual counter terminal deadlines, cancellation and unknown-clock handling |
 | `test_isp.c` through `run.sh` | Functional ISP pixel checks under ASan/UBSan |
 | `make_cmos.py` | Generated Bayer packing round trips |
 | `test_irq99.py` | Pending completion IRQ mask/W1C, SDES readback, grid enable and Z6 machine/memory isolation |
@@ -45,3 +48,17 @@ The documented independent export smoke test used the accepted official MAIN, th
 For comparison runs, record the firmware and binary hashes, profile, RAW manifest, mode, starting value, exact input and resulting native readback/display. A successful build or register assertion alone does not establish the displayed camera behavior.
 
 The working-baseline results and independent-export results above have different scopes. The original local screenshots and logs remain outside the public source inventory.
+
+## 2026-10-11 preview checks
+
+The source-only candidate passed three synthetic input test groups, the actual grid renderer and LCD region/bank compositor under ASan/UBSan, and 593 ISP checks. The grid test's source extraction was updated to stop at the newly inserted overlay function; the asserted grid behavior was retained.
+
+The portable AF builder reproduced the existing tested research helper byte-for-byte using the same ARM GNU toolchain. It accepts a toolchain directory or PATH instead of a private absolute path.
+
+The candidate shoulder test executed native decompression, ingress, publication and rendering against a local identity-checked companion image: six pixel cases and four malformed-input rejections passed. The firmware and resulting images are not in this source package.
+
+These candidate checks are separate from earlier development-guest visual records. The optional shoulder test loads proprietary firmware locally and is excluded from public CI.
+
+The preview overlay was built from a separate extraction of the hash-verified QEMU 10.2.4 archive; all 1,363 build targets completed. The new binary passed the five existing machine/IRQ/readback checks and all seven CAPTG counter cases. The archive was supplied locally; this check did not exercise the download branch.
+
+An independent candidate guest then passed the live shoulder test (native dial change/reversal and pause/resume), six AF display pixel cases, and restart recovery of AF state and shoulder pixels. Original MENU input also completed. Main LCD and shoulder snapshots were inspected locally; screenshots and session records are excluded from this source package. The owned review guest and launcher were closed after the checks.

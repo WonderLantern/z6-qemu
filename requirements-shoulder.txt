@@ -1,0 +1,2 @@
+# Optional native companion-MCU function execution for the shoulder display.
+unicorn==2.1.4

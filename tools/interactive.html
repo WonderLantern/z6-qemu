@@ -44,12 +44,23 @@ button:disabled{opacity:.35;cursor:default}
   <div class="error" id="error" hidden></div>
 </section>
 <aside aria-label="相机控制">
+  <div style="margin-bottom:12px"><div>肩屏</div><img id="shoulder-frame" alt="原厂肩屏" width="128" height="96" style="width:128px;height:96px;image-rendering:pixelated" hidden><div id="shoulder-message">等待肩屏数据</div></div>
   <div class="row"><button data-key="menu" title="M">MENU</button><button data-key="play" title="P">回放</button></div>
   <div class="pad">
     <span></span><button data-key="up" aria-label="上">↑</button><span></span>
     <button data-key="left" aria-label="左或返回" title="← / Esc">←</button><button data-key="ok" title="Enter">OK</button><button data-key="right" aria-label="右">→</button>
     <span></span><button data-key="down" aria-label="下">↓</button><span></span>
   </div>
+  <p id="probe-result" hidden></p>
+  <div class="row" id="capture-row" hidden><button data-key="capture">拍照</button><button data-key="counter_probe" title="原厂计数器自检，尚非曝光完成测试">计时自检</button></div>
+  <section id="af-controls" aria-label="对焦框诊断">
+    <div style="font-size:12px;margin:8px 0">对焦框 · 模拟状态</div>
+    <div class="row"><button data-key="af_s">AF S</button><button data-key="af_l">AF L</button></div>
+    <div class="row"><button data-key="af_toggle" id="af-toggle">启用框</button></div>
+    <div class="row"><button data-key="af_left">←</button><button data-key="af_up">↑</button><button data-key="af_down">↓</button><button data-key="af_right">→</button></div>
+    <div class="row"><button data-key="af_idle">等待</button><button data-key="af_locked">合焦</button><button data-key="af_failed">失焦</button></div>
+    <p id="af-status" style="font-size:12px;color:#aaa"></p>
+  </section>
   <div class="row"><button data-key="i" title="I">i</button><button data-key="delete" title="Delete">删除</button></div>
   <div class="dial" style="font-size:12px">当前无镜头，调快门请选 M</div>
   <div class="row" aria-label="曝光模式"><button data-key="mode_p">P</button><button data-key="mode_s">S</button><button data-key="mode_a">A</button><button data-key="mode_m">M</button></div>
@@ -61,7 +72,7 @@ button:disabled{opacity:.35;cursor:default}
 </div>
 </main>
 <script>
-const token='__TOKEN__';let state={},frame=-1,fetching=false;const el=id=>document.getElementById(id);
+const token='__TOKEN__';let state={},frame=-1,shoulderFrame=-1,fetching=false;const el=id=>document.getElementById(id);
 async function action(action,key){try{const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json','X-Z6-Token':token},body:JSON.stringify({action,key})});const j=await r.json();if(!r.ok)throw Error(j.error);el('toast').textContent=key?'按键已发送…':'操作已发送…';}catch(e){el('toast').textContent=e.message;}}
 document.querySelectorAll('[data-key]').forEach(b=>b.addEventListener('click',()=>action('key',b.dataset.key)));
 document.querySelectorAll('[data-dial]').forEach(d=>d.addEventListener('wheel',e=>{e.preventDefault();if(state.phase==='running'&&!state.busy&&e.deltaY)action('key',d.dataset.dial+(e.deltaY>0?'_cw':'_ccw'));},{passive:false}));
@@ -74,7 +85,20 @@ async function poll(){if(fetching)return;fetching=true;try{const r=await fetch('
 document.querySelectorAll('[data-key]').forEach(b=>b.disabled=state.phase!=='running'||state.busy);
 for(const [name,value] of Object.entries({mode_p:0,mode_a:1,mode_s:2,mode_m:3}))document.querySelector(`[data-key="${name}"]`).setAttribute('aria-pressed',String(state.exposure?.mode===value));el('pause').disabled=!['running','paused'].includes(state.phase)||state.busy;el('pause').textContent=state.phase==='paused'?'恢复':'暂停';el('restart').disabled=state.phase==='booting'||state.busy;el('stop').disabled=state.phase==='booting'||state.phase==='stopped'||state.busy;
 for(const id of ['menu-profile','shooting'])el(id).disabled=state.phase==='booting'||state.busy;
+el('af-controls').hidden=state.profile!=='shooting';
+const af=state.focus||{enabled:false,mode:'S',status:'idle'};
+el('af-toggle').textContent=af.enabled?'关闭框':'启用框';
+for(const mode of ['s','l'])document.querySelector(`[data-key="af_${mode}"]`).setAttribute('aria-pressed',String(af.mode===mode.toUpperCase()));
+for(const key of ['af_left','af_right','af_up','af_down','af_idle','af_locked','af_failed'])document.querySelector(`[data-key="${key}"]`).disabled=!af.enabled||state.phase!=='running'||state.busy;
+el('af-status').textContent=`${af.enabled?'已启用':'已关闭'} · ${af.mode}${af.size?' · '+af.size.join('×'):''} · 状态为测试注入`;
+el('capture-row').hidden=!state.exposure_probe_enabled;
+el('probe-result').hidden=!state.exposure_probe_enabled;
+const cp=state.counter_probe, cap=state.capture_probe;
+el('probe-result').textContent=(cp?`原厂计数器自检：${cp.converter_ns/1e9}s 换算 · 通道 ${cp.channel} 配置${cp.enabled&&cp.restored_inactive?'通过并已还原':'未通过'}；时钟单位待实机确认。`:'')+(cap?' 拍照输入已提交；尚未确认传感器曝光开始。':'');
 el('error').hidden=!state.error;el('error').textContent=state.error||'';
+const shoulder=state.shoulder||{};el('shoulder-message').textContent=shoulder.message||'肩屏未启用';
+if(!shoulder.frame){el('shoulder-frame').hidden=true;shoulderFrame=-1;}
+if(shoulder.frame&&shoulderFrame!==shoulder.frame){const response=await fetch('/api/shoulder?v='+shoulder.frame);if(response.ok){const img=el('shoulder-frame'),old=img.src;img.onload=()=>{if(old.startsWith('blob:'))URL.revokeObjectURL(old);};img.src=URL.createObjectURL(await response.blob());img.hidden=false;shoulderFrame=shoulder.frame;}}
 el('raw-input').hidden=!state.raw_input;
 if(state.device_evidence){const e=state.device_evidence;el('raw-input').textContent=`${e.raw_width}×${e.raw_height} ${e.raw_bits} bit · 输入 ${e.raw_batches} 批 · 处理 ${e.isp_batches} 批 · ${e.processed_buffer_scanned?'LCD 已读取处理结果':'等待 LCD'}`;}
 else if(state.raw_input){const raw=state.raw_input;el('raw-input').textContent=`RAW 测试源（Z6 输入格式未确认）：${raw.width}×${raw.height} ${raw.cfa} ${raw.sample_bits} bit · 已校验 ${raw.validated_frames} 帧 · 传入虚拟机 ${raw.guest_frames_transferred} 帧 · 固件消费 ${raw.firmware_frames_consumed} 帧`;}

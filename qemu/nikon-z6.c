@@ -272,6 +272,24 @@ static void nikon_mmio_trace(hwaddr addr, unsigned size, bool write, uint64_t va
 {
     static int quiet = -1;
     static int capture_trace = -1;
+    static int exposure_trace = -1;
+    static unsigned exposure_events;
+    if (exposure_trace < 0) { exposure_trace = getenv("Z6_TRACE_EXPOSURE") != NULL; }
+    /* Passive, bounded evidence; no register or IRQ behavior is changed. */
+    if (exposure_trace && write &&
+        ((addr >= 0x20060000 && addr < 0x20070000) ||
+         (addr >= 0x2c011000 && addr < 0x2c011d00) ||
+         addr == 0x04282018 || addr == 0x0428201c)) {
+        if (exposure_events++ < 8192) {
+            uint32_t pc = current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0;
+            fprintf(stderr, "Z6_EXPOSURE_MMIO virtual_ns=%" PRId64
+                    " addr=0x%08" HWADDR_PRIx " size=%u value=0x%08" PRIx64
+                    " pc=0x%08x cpu=%d\n", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                    addr, size, value, pc, current_cpu ? current_cpu->cpu_index : -1);
+        } else if (exposure_events == 8193) {
+            fprintf(stderr, "Z6_EXPOSURE_TRACE_LIMIT events=8192\n");
+        }
+    }
     if (quiet < 0) { quiet = getenv("Z6_MMIO_QUIET") != NULL; }
     if (capture_trace < 0) { capture_trace = getenv("Z6_CAPTURE_TRACE") != NULL; }
     if (quiet && !(capture_trace && ((addr >= 0x20060000 && addr < 0x20070000) ||
@@ -708,6 +726,13 @@ static void nikon_exmcu_packet(NikonLabState *s)
             tx[0], length, tx[8], sum, valid);
     for (unsigned i = 0; i < MIN(length, 32); i++) { fprintf(stderr, "%02x", tx[8+i]); }
     fprintf(stderr, "\n");
+    /* Preserve complete validated semantic packets for the companion-display
+     * harness. This observer does not ACK new commands or modify guest state. */
+    if (valid && length == 0x70 && tx[0] == 8 && tx[8] == 4) {
+        fprintf(stderr, "Z6_SHOULDER_PACKET channel=%u length=%u sequence=%u data=", tx[0], length, lduw_le_p(tx + 4));
+        for (unsigned i = 0; i < length; i++) { fprintf(stderr, "%02x", tx[8+i]); }
+        fprintf(stderr, "\n");
+    }
     uint8_t response = valid && tx[0] == 9 && tx[8] == 2 && length == 6 ? 3 :
                        valid && tx[0] == 9 && tx[8] == 4 && length == 5 ? 5 : 0;
     /* Channel table 11521c14 -> 102351de. The original serializers
@@ -1003,6 +1028,11 @@ static void nikon_channel_expire(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     for (unsigned ch = 0; ch < 12; ch++) {
         if (!s->channel_clocked[ch] || s->channel_deadline[ch] > now) { continue; }
+        if (getenv("Z6_TRACE_EXPOSURE")) {
+            fprintf(stderr, "Z6_COUNTER_TIMING phase=terminal channel=%u virtual_ns=%" PRId64
+                    " scheduled_ns=%" PRId64 " scope=timer_only\n",
+                    ch, now, s->channel_deadline[ch]);
+        }
         s->channel_counter[ch] = 0;
         s->channel_epoch[ch] = s->channel_deadline[ch];
         s->channel_deadline[ch] += ((uint64_t)s->channel_config[ch][1][2] + 1) * 1000;
@@ -1052,6 +1082,11 @@ static bool nikon_channel_access(NikonLabState *s, hwaddr addr, unsigned size,
                 }
                 for (unsigned ch = 0; ch < 12; ch++) {
                     if (!(changed & (1U << ch))) { continue; }
+                    if (s->channel_clocked[ch] && getenv("Z6_TRACE_EXPOSURE")) {
+                        fprintf(stderr, "Z6_COUNTER_TIMING phase=stop channel=%u virtual_ns=%" PRId64
+                                " scheduled_ns=%" PRId64 " scope=timer_only\n",
+                                ch, now, s->channel_deadline[ch]);
+                    }
                     s->channel_counter[ch] = nikon_channel_count(s, ch, now);
                     s->channel_clocked[ch] = false;
                     if ((*value & (1U << ch)) && s->channel_config[ch][1][1] == 0x31) {
@@ -1059,6 +1094,12 @@ static bool nikon_channel_access(NikonLabState *s, hwaddr addr, unsigned size,
                         s->channel_epoch[ch] = now;
                         s->channel_deadline[ch] = now + ((uint64_t)terminal - s->channel_counter[ch] + 1) * 1000;
                         s->channel_clocked[ch] = true;
+                        if (getenv("Z6_TRACE_EXPOSURE")) {
+                            fprintf(stderr, "Z6_COUNTER_TIMING phase=start channel=%u virtual_ns=%" PRId64
+                                    " scheduled_ns=%" PRId64 " initial=0x%x terminal=0x%x"
+                                    " tick_ns=1000 tick_hypothesis=1 scope=timer_only\n",
+                                    ch, now, s->channel_deadline[ch], s->channel_counter[ch], terminal);
+                        }
                         fprintf(stderr, "Z6_COUNTER_START channel=%u initial=0x%x terminal=0x%x tick_ns=1000 hypothesis=1\n",
                                 ch, s->channel_counter[ch], terminal);
                     }
@@ -2500,6 +2541,54 @@ static void nikon_lcd_grid(uint32_t *r, uint8_t *out, unsigned stride,
     }
 }
 
+/* Native 102446ce submits ten regions per component; 10245494 selects
+ * one of four shared color bases for region0. Captured native AF region5
+ * uses an absolute color address and absolute placement. Alpha addresses
+ * are per-region. YYUV422A profile only.
+ * This consumes guest buffers and never synthesizes AF primitives. */
+static unsigned nikon_lcd_overlay(uint32_t *r, unsigned plane, uint8_t *out,
+                                  unsigned stride, unsigned w, unsigned h)
+{
+    unsigned base = plane ? 0x3000 : 0x2000;
+    if (!(r[(base+0x110)/4] & 1) || r[(base+0x200)/4] != 0x30006) { return 0; }
+    unsigned bank = (r[(base+0x214)/4] >> 8) & 3;
+    /* Native102435f2 reads the active bank in bits16..17. Latch at scanout. */
+    r[(base+0x214)/4] = (r[(base+0x214)/4] & ~0x30000U) | bank << 16;
+    uint32_t color_base = r[(base+0x440)/4+bank];
+    unsigned count = 0;
+    for (unsigned region=0; region<10; region++) {
+        if (!(r[(base+0x5c0)/4] & (1U<<region))) { continue; }
+        uint32_t size = r[(base+0x400)/4+region];
+        uint32_t xy = r[(base+0x580)/4+region];
+        unsigned rw=size&0xffff, rh=(size>>16)&0x3fff;
+        unsigned x0=xy&0xffff, y0=(xy>>16)&0x3fff;
+        unsigned cs=r[(base+0x500)/4+region], as=r[(base+0x540)/4+region];
+        uint64_t ca=region ? r[(base+0x47c)/4+region] : color_base;
+        uint32_t aa=r[(base+0x4c0)/4+region];
+        if (!rw || !rh || x0>=w || y0>=h || rw>4096 || rh>4096 ||
+            cs<((rw+1)&~1U)*2 || as<rw || ca>UINT32_MAX ||
+            !nikon_gpu_range(ca,(uint64_t)cs*rh,false) ||
+            !nikon_gpu_range(aa,(uint64_t)as*rh,false)) { continue; }
+        g_autofree uint8_t *cp=g_malloc(cs), *ap=g_malloc(as);
+        for (unsigned y=0; y<MIN(rh,h-y0); y++) {
+            cpu_physical_memory_read(ca+(uint64_t)y*cs,cp,cs);
+            cpu_physical_memory_read(aa+(uint64_t)y*as,ap,as);
+            for (unsigned x=0; x<MIN(rw,w-x0); x++) {
+                uint8_t top[4];
+                nikon_gpu_pixel_read(cp,ap,0x107,false,x,top);
+                uint8_t *dest=out+(size_t)(y+y0)*stride+(x+x0)*4;
+                uint32_t pixel=ldl_p(dest);
+                unsigned red=(top[0]*top[3]+((pixel>>16)&255)*(255-top[3])+127)/255;
+                unsigned green=(top[1]*top[3]+((pixel>>8)&255)*(255-top[3])+127)/255;
+                unsigned blue=(top[2]*top[3]+(pixel&255)*(255-top[3])+127)/255;
+                stl_p(dest,(red<<16)|(green<<8)|blue);
+            }
+        }
+        count++;
+    }
+    return count;
+}
+
 static void nikon_lcd_present(void *opaque)
 {
     NikonLabState *s = opaque;
@@ -2528,18 +2617,7 @@ static void nikon_lcd_present(void *opaque)
     g_autofree uint8_t *yp = g_malloc((size_t)ys*h), *up = g_malloc((size_t)us*uvh);
     cpu_physical_memory_read(ya, yp, (size_t)ys*h);
     cpu_physical_memory_read(ua, up, (size_t)us*uvh);
-    bool overlay = (r[0x2110/4] & 1) && r[0x2200/4] == 0x30006 &&
-        r[0x2204/4] == r[0x204/4] && r[0x2400/4] == r[0x204/4] &&
-        r[0x2500/4] == w*2 && r[0x2540/4] == w &&
-        r[0x2580/4] == 0 && (r[0x25c0/4] & 1);
     uint32_t ca = r[0x2440/4], aa = r[0x24c0/4];
-    g_autofree uint8_t *cp = NULL, *ap = NULL;
-    if (overlay && nikon_gpu_range(ca, (uint64_t)w*h*2, false) &&
-        nikon_gpu_range(aa, (uint64_t)w*h, false)) {
-        cp = g_malloc((size_t)w*h*2); ap = g_malloc((size_t)w*h);
-        cpu_physical_memory_read(ca, cp, (size_t)w*h*2);
-        cpu_physical_memory_read(aa, ap, (size_t)w*h);
-    } else { overlay = false; }
     if (!s->gpu->lcd_scanout) {
         s->gpu->lcd_scanout = true;
         qemu_console_resize(s->gpu->console, w, h);
@@ -2552,20 +2630,40 @@ static void nikon_lcd_present(void *opaque)
     uint8_t *out = surface_data(surface);
     for (unsigned y = 0; y < h; y++) {
         for (unsigned x = 0; x < w; x++) {
-            size_t i = (size_t)y*w+x;
-            uint8_t pixel[4], top[4];
+            uint8_t pixel[4];
             size_t uvindex = (size_t)(nv12 ? y/2 : y)*us+(x & ~1U);
             nikon_yuv_rgb(yp[y*ys+x], up[uvindex], up[uvindex+1], pixel);
-            if (overlay) {
-                nikon_gpu_pixel_read(cp, ap, 0x107, false, i, top);
-                for (unsigned c = 0; c < 3; c++) {
-                    pixel[c] = (top[c]*top[3] + pixel[c]*(255-top[3]) + 127)/255;
-                }
-            }
             stl_p(out + y*surface_stride(surface) + x*4,
                   (pixel[0]<<16) | (pixel[1]<<8) | pixel[2]);
         }
     }
+    unsigned overlay=nikon_lcd_overlay(r,0,out,surface_stride(surface),w,h);
+    /* The explicit no-lens fixture has no AF position producer. Its empty
+     * native ROI leaves a stale small AF tile at (0,0). Do not scan out that
+     * invalid-input AF plane; a supplied ROI immediately restores normal
+     * native composition. This is a fixture boundary, not a general camera
+     * rule or a change to firmware geometry/GPU buffers. The HUD/diagnostic
+     * AF plane remains independent. */
+    uint8_t af_roi[8] = {0};
+    bool invalid_af_input = false;
+    if (s->z6_profile && s->exmcu_no_lens) {
+        cpu_physical_memory_read(0xc1f97480, af_roi, sizeof(af_roi));
+        invalid_af_input = true;
+        for (unsigned i = 0; i < sizeof(af_roi); i++) {
+            if (af_roi[i]) { invalid_af_input = false; break; }
+        }
+        if (invalid_af_input) {
+            uint8_t geometry[10];
+            cpu_physical_memory_read(0xc1f9716c, geometry, sizeof(geometry));
+            int cx2 = 2*(int16_t)lduw_le_p(geometry) + lduw_le_p(geometry+6);
+            int cy2 = 2*(int16_t)lduw_le_p(geometry+2) + lduw_le_p(geometry+8);
+            /* A valid already-submitted frame may outlive the producer's
+             * next empty snapshot. Preserve it when its center is valid. */
+            invalid_af_input = cx2 == 0 && cy2 == 0;
+        }
+    }
+    unsigned overlay2=invalid_af_input ? 0 :
+        nikon_lcd_overlay(r,1,out,surface_stride(surface),w,h);
     nikon_lcd_grid(r, out, surface_stride(surface), w, h);
     dpy_gfx_update(s->gpu->console, 0, 0, w, h);
     /* Functional frame boundary, only after reading validated native buffers.
@@ -2574,8 +2672,8 @@ static void nikon_lcd_present(void *opaque)
     r[0x1214/4] |= 1U << 16;
     nikon_display_irq_update(s);
     if (!(s->lcd_frames++ % 30)) {
-        fprintf(stderr, "Z6_LCD_SCANOUT frame=%u y=0x%08x uv=0x%08x overlay=%u color=0x%08x alpha=0x%08x size=%ux%u input=%s overlay_format=YYUV422A bit_accurate=0\n",
-                s->lcd_frames, ya, ua, overlay, ca, aa, w, h, nv12 ? "NV12" : "NV16");
+        fprintf(stderr, "Z6_LCD_SCANOUT frame=%u y=0x%08x uv=0x%08x overlay=%u overlay2=%u bank=%u/%u color=0x%08x alpha=0x%08x size=%ux%u input=%s overlay_format=YYUV422A bit_accurate=0\n",
+                s->lcd_frames, ya, ua, overlay, overlay2,(r[0x2214/4]>>16)&3,(r[0x3214/4]>>16)&3,ca, aa, w, h, nv12 ? "NV12" : "NV16");
     }
 }
 

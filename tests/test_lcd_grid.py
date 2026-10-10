@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess,tempfile
 source=(Path(__file__).resolve().parents[1]/'qemu/nikon-z6.c').read_text()
 start=source.index('static void nikon_lcd_grid(')
-end=source.index('static void nikon_lcd_present(',start)
+end=source.index('static unsigned nikon_lcd_overlay(',start)
 body=source[start:end]
 pre=r'''#include <stdint.h>
 #include <stddef.h>
